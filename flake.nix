@@ -1,5 +1,5 @@
 {
-  description = "Rust project";
+  description = "vlt";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
