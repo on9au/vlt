@@ -1,0 +1,5 @@
+# direnv's cached dev shell.
+/.direnv/
+
+# `cargo build` output.
+/target/
