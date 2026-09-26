@@ -3,4 +3,27 @@ name = "vlt"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vlt"
+path = "src/main.rs"
+
 [dependencies]
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
+postcard = { version = "1", features = ["alloc"] }
+rand = "0.10"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
