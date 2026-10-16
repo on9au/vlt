@@ -39,6 +39,15 @@ const HEADER_LEN: usize = MAGIC.len() + size_of::<u16>() + 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ObjectId(pub [u8; 16]);
 
+impl ObjectId {
+    /// Parses the lowercase-hex form `Display` produces; nothing else.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let mut id = [0u8; 16];
+        let lower = s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        (lower && hex::decode_to_slice(s, &mut id).is_ok()).then_some(Self(id))
+    }
+}
+
 impl std::fmt::Display for ObjectId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&hex::encode(self.0))

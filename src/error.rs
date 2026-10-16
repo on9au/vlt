@@ -47,6 +47,9 @@ pub enum Error {
     #[error("invalid vault path: {0}")]
     BadPath(&'static str),
 
+    #[error("the vault is in use by another vlt process")]
+    Locked,
+
     #[error("a file already exists at that path")]
     AlreadyExists,
 

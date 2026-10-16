@@ -5,6 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Read, Write},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use crate::{Error, Result};
@@ -137,4 +138,43 @@ fn private_dir_builder() -> fs::DirBuilder {
         b.mode(0o700);
     }
     b
+}
+
+/// Set mtime, then permissions (in that order, so a read-only mode can't
+/// stop us setting the time). Either may be absent.
+pub fn apply_meta(path: &Path, mtime: Option<SystemTime>, mode: Option<u32>) -> Result<()> {
+    if let Some(t) = mtime {
+        OpenOptions::new().write(true).open(path)?.set_modified(t)?;
+    }
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
+}
+
+/// An exclusive lock on a vault directory, held until dropped. Advisory: it
+/// only keeps other `vlt` processes out.
+#[derive(Debug)]
+pub struct DirLock(#[allow(dead_code)] File);
+
+/// Take the lock at `path` (creating the file if needed) without waiting:
+/// `Error::Locked` if another process holds it.
+pub fn lock(path: &Path) -> Result<DirLock> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(DirLock(file)),
+        Err(fs::TryLockError::WouldBlock) => Err(Error::Locked),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }

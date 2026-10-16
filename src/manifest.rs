@@ -17,7 +17,10 @@
 //! Directories are implicit: `a/b` exists as a directory as long as some
 //! file lives under it.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use zeroize::Zeroizing;
 
@@ -48,6 +51,47 @@ pub struct Entry {
     pub object: ObjectId,
     /// Plaintext size
     pub size: u64,
+    /// When the file was last modified, if known.
+    pub mtime: Option<Mtime>,
+    /// Permission bits (`0o777` at most), if known. setuid/setgid/sticky are
+    /// never stored, so extracting can't create a setuid binary.
+    pub mode: Option<u32>,
+}
+
+/// A point in time relative to the Unix epoch (`secs` may be negative).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Mtime {
+    pub secs: i64,
+    pub nanos: u32,
+}
+
+impl Mtime {
+    pub fn from_system(t: SystemTime) -> Self {
+        match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => Self {
+                secs: d.as_secs() as i64,
+                nanos: d.subsec_nanos(),
+            },
+            Err(e) => {
+                // Before the epoch: floor to whole seconds, nanos counting up.
+                let d = e.duration();
+                let (secs, nanos) = match d.subsec_nanos() {
+                    0 => (-(d.as_secs() as i64), 0),
+                    n => (-(d.as_secs() as i64) - 1, 1_000_000_000 - n),
+                };
+                Self { secs, nanos }
+            }
+        }
+    }
+
+    pub fn to_system(self) -> Option<SystemTime> {
+        let base = if self.secs >= 0 {
+            UNIX_EPOCH.checked_add(Duration::from_secs(self.secs as u64))?
+        } else {
+            UNIX_EPOCH.checked_sub(Duration::from_secs(self.secs.unsigned_abs()))?
+        };
+        base.checked_add(Duration::from_nanos(self.nanos.into()))
+    }
 }
 
 /// One line of a directory listing.
@@ -69,6 +113,11 @@ impl Manifest {
     /// Whether `insert(path, _, replace)` would succeed. Lets callers fail
     /// before doing expensive work (like encrypting the file).
     pub fn check_insert(&self, path: &str, replace: bool) -> Result<()> {
+        // Normalized paths are checked already; this catches ones built by
+        // `rename` from a long prefix.
+        if path.len() > MAX_PATH_LEN {
+            return Err(Error::BadPath("path too long"));
+        }
         if self.entries.contains_key(path) {
             return if replace {
                 Ok(())
@@ -94,6 +143,64 @@ impl Manifest {
 
     pub fn remove(&mut self, path: &str) -> Result<Entry> {
         self.entries.remove(path).ok_or(Error::NoSuchPath)
+    }
+
+    /// Remove every file under directory `dir`. Refuses the root.
+    pub fn remove_dir(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        if dir.is_empty() {
+            return Err(Error::BadPath("refusing to remove the whole vault"));
+        }
+        let paths: Vec<String> = self.children(dir).map(|(p, _)| p.to_owned()).collect();
+        if paths.is_empty() {
+            return Err(Error::NoSuchPath);
+        }
+        Ok(paths
+            .iter()
+            .map(|p| self.entries.remove(p).expect("just listed"))
+            .collect())
+    }
+
+    /// Rename a file, or a directory with everything under it. `to` must not
+    /// exist yet: nothing is ever merged or overwritten. All or nothing.
+    /// Returns how many files moved.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<usize> {
+        if from.is_empty() || to.is_empty() {
+            return Err(Error::BadPath("can't move the root"));
+        }
+        if to == from || to.starts_with(&format!("{from}/")) {
+            return Err(Error::BadPath("can't move something into itself"));
+        }
+        let moving: Vec<(String, Entry)> = match self.entries.get(from) {
+            Some(e) => vec![(from.to_owned(), *e)],
+            None => self
+                .children(from)
+                .map(|(p, e)| (p.to_owned(), *e))
+                .collect(),
+        };
+        if moving.is_empty() {
+            return Err(Error::NoSuchPath);
+        }
+        // Checked up front for a clear error; the inserts below would catch
+        // it too, but as "a parent is a file" when `to` is a file.
+        if self.entries.contains_key(to) || self.children(to).next().is_some() {
+            return Err(Error::PathExists);
+        }
+        let mut next = self.clone();
+        for (path, _) in &moving {
+            next.entries.remove(path);
+        }
+        for (path, entry) in &moving {
+            next.insert(format!("{to}{}", &path[from.len()..]), *entry, false)?;
+        }
+        *self = next;
+        Ok(moving.len())
+    }
+
+    /// Every file under directory `dir` (`""` for all), with its path
+    /// relative to `dir`.
+    pub fn files_under<'a>(&'a self, dir: &str) -> impl Iterator<Item = (&'a str, &'a Entry)> {
+        let skip = if dir.is_empty() { 0 } else { dir.len() + 1 };
+        self.children(dir).map(move |(p, e)| (&p[skip..], e))
     }
 
     /// Immediate children of directory `dir` (`""` for the root), or the

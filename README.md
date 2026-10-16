@@ -17,7 +17,14 @@ A file vault for protecting files at rest.
 ```sh
 vlt init my.vault                          # prints the recovery key once
 vlt add  my.vault report.pdf --as tax/2025.pdf
+vlt add  my.vault ~/photos                 # directories: recursive, all or nothing
 vlt ls   my.vault tax
 vlt get  my.vault tax/2025.pdf -o out.pdf  # `-o -` for stdout
-vlt rm   my.vault tax/2025.pdf
+vlt get  my.vault photos -o restored/      # into a new directory
+vlt mv   my.vault tax archive/tax
+vlt rm   my.vault tax/2025.pdf             # `-r` for a directory
+vlt fsck my.vault --verify                 # `gc` cleans up after crashes
 ```
+
+Files keep their mtime and permission bits (never setuid/setgid). Symlinks
+are skipped, and empty directories aren't stored.

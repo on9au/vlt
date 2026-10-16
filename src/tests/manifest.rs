@@ -10,6 +10,8 @@ fn entry(n: u8, size: u64) -> Entry {
     Entry {
         object: ObjectId([n; 16]),
         size,
+        mtime: None,
+        mode: None,
     }
 }
 
@@ -139,4 +141,81 @@ fn seal_open_round_trip_and_tampering() {
         Manifest::open(&other, &sealed),
         Err(Error::BadManifest)
     ));
+}
+
+#[test]
+fn rename_moves_files_and_whole_directories() {
+    let mut m = manifest(&["a/x", "a/sub/y", "ab", "f"]);
+    assert_eq!(m.rename("a", "b/c").unwrap(), 2);
+    assert_eq!(
+        m.entries().map(|(p, _)| p).collect::<Vec<_>>(),
+        ["ab", "b/c/sub/y", "b/c/x", "f"]
+    );
+    assert_eq!(m.get("b/c/x"), Some(&entry(0, 0)), "entry travels intact");
+
+    assert_eq!(m.rename("f", "g").unwrap(), 1);
+    assert!(m.get("f").is_none() && m.get("g").is_some());
+}
+
+#[test]
+fn rename_never_merges_overwrites_or_half_applies() {
+    let m = manifest(&["a/x", "a/y", "b/y", "file"]);
+    for (from, to, want) in [
+        ("a", "b", "PathExists"),    // b exists (as a directory)
+        ("a", "file", "PathExists"), // file exists
+        ("a", "file/z", "BadPath"),  // parent is a file
+        ("a", "a/inner", "BadPath"), // into itself
+        ("a", "a", "BadPath"),
+        ("nope", "z", "NoSuchPath"),
+        ("a", "", "BadPath"),
+    ] {
+        let mut m2 = m.clone();
+        let err = m2.rename(from, to).unwrap_err();
+        assert!(
+            format!("{err:?}").starts_with(want),
+            "{from}->{to}: {err:?}"
+        );
+        assert_eq!(m2, m, "{from}->{to} must leave the manifest untouched");
+    }
+}
+
+#[test]
+fn remove_dir_takes_everything_under_it_but_never_the_root() {
+    let mut m = manifest(&["a/x", "a/sub/y", "ab"]);
+    assert!(matches!(m.remove_dir(""), Err(Error::BadPath(_))));
+    assert!(matches!(m.remove_dir("nope"), Err(Error::NoSuchPath)));
+    assert_eq!(m.remove_dir("a").unwrap().len(), 2);
+    assert_eq!(m.entries().map(|(p, _)| p).collect::<Vec<_>>(), ["ab"]);
+}
+
+#[test]
+fn files_under_gives_relative_paths() {
+    let m = manifest(&["a/x", "a/sub/y", "ab"]);
+    let rel = |d| m.files_under(d).map(|(p, _)| p).collect::<Vec<_>>();
+    assert_eq!(rel("a"), ["sub/y", "x"]);
+    assert_eq!(rel(""), ["a/sub/y", "a/x", "ab"]);
+    assert!(rel("nope").is_empty());
+}
+
+#[test]
+fn mtime_round_trips_including_before_the_epoch() {
+    use crate::manifest::Mtime;
+    use std::time::{Duration, UNIX_EPOCH};
+    for t in [
+        UNIX_EPOCH,
+        UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789),
+        UNIX_EPOCH - Duration::new(5, 0),
+        UNIX_EPOCH - Duration::new(5, 250_000_000),
+    ] {
+        let m = Mtime::from_system(t);
+        assert!(m.nanos < 1_000_000_000);
+        assert_eq!(m.to_system(), Some(t));
+    }
+    assert_eq!(
+        Mtime::from_system(UNIX_EPOCH - Duration::new(5, 250_000_000)),
+        Mtime {
+            secs: -6,
+            nanos: 750_000_000
+        }
+    );
 }
