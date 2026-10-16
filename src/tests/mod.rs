@@ -15,7 +15,9 @@ use crate::{
 
 use tempfile::TempDir;
 
+mod manifest;
 mod object;
+mod store;
 
 const KDF: KdfParams = KdfParams::INSECURE_TEST;
 

@@ -35,6 +35,18 @@ pub enum Error {
     #[error("encrypted object is corrupt or was modified")]
     BadObject,
 
+    #[error("vault manifest is corrupt or was modified")]
+    BadManifest,
+
+    #[error("no such file or directory in the vault")]
+    NoSuchPath,
+
+    #[error("something already exists at that vault path")]
+    PathExists,
+
+    #[error("invalid vault path: {0}")]
+    BadPath(&'static str),
+
     #[error("a file already exists at that path")]
     AlreadyExists,
 

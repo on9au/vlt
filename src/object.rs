@@ -36,7 +36,7 @@ pub const CHUNK_LEN: usize = 64 * 1024;
 const HEADER_LEN: usize = MAGIC.len() + size_of::<u16>() + 16;
 
 /// Random object id, also the object's file name (as hex).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ObjectId(pub [u8; 16]);
 
 impl std::fmt::Display for ObjectId {
@@ -53,10 +53,46 @@ pub fn encrypted_len(plaintext_len: u64) -> u64 {
 
 /// Encrypt everything `src` yields into `dst` under a fresh object id.
 /// Returns the id and the plaintext length.
-pub fn encrypt(vault: &Vault, mut src: impl Read, mut dst: impl Write) -> Result<(ObjectId, u64)> {
-    let id = ObjectId(random_bytes());
-    let header = header(&id);
-    let key = object_key(vault, &id);
+pub fn encrypt(vault: &Vault, src: impl Read, dst: impl Write) -> Result<(ObjectId, u64)> {
+    let enc = Encryptor::new(vault);
+    let id = enc.id();
+    Ok((id, enc.encrypt(src, dst)?))
+}
+
+/// A fresh object id, known before encrypting (e.g. to name the file).
+/// `encrypt` consumes it, so an id can never encrypt twice.
+#[must_use = "an Encryptor does nothing until `encrypt` is called"]
+pub struct Encryptor<'v> {
+    vault: &'v Vault,
+    id: ObjectId,
+}
+
+impl<'v> Encryptor<'v> {
+    pub fn new(vault: &'v Vault) -> Self {
+        Self {
+            vault,
+            id: ObjectId(random_bytes()),
+        }
+    }
+
+    pub fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    /// Returns the plaintext length.
+    pub fn encrypt(self, src: impl Read, dst: impl Write) -> Result<u64> {
+        encrypt_as(self.vault, &self.id, src, dst)
+    }
+}
+
+fn encrypt_as(
+    vault: &Vault,
+    id: &ObjectId,
+    mut src: impl Read,
+    mut dst: impl Write,
+) -> Result<u64> {
+    let header = header(id);
+    let key = object_key(vault, id);
     dst.write_all(&header)?;
 
     // Double-buffered: a chunk is only final once we've seen nothing follows it.
@@ -82,7 +118,7 @@ pub fn encrypt(vault: &Vault, mut src: impl Read, mut dst: impl Write) -> Result
         cur_len = next_len;
     }
     dst.flush()?;
-    Ok((id, total))
+    Ok(total)
 }
 
 /// Decrypt object `id` from `src` into `dst`. Returns the plaintext length.

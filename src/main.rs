@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -6,16 +8,18 @@ use clap::{Parser, Subcommand};
 use vlt::{
     crypto::RecoveryKey,
     header::{KdfParams, SlotId},
+    manifest::{self, Listing},
     ops::{self, SlotRef},
     slot::Credential,
-    vault::LockedVault,
+    store::{self, Store},
+    vault::{LockedVault, Vault},
 };
 use zeroize::Zeroizing;
 
 const MIN_PASSWORD_CHARS: usize = 12;
 
 #[derive(Parser)]
-#[command(version, about = "Local encrypted vault (M1: keyslots only)")]
+#[command(version, about = "Local encrypted file vault")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -23,22 +27,46 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a new vault and print its recovery key (shown once)
+    /// Create a new vault directory and print its recovery key (shown once)
     Init {
-        path: PathBuf,
+        vault: PathBuf,
         #[command(flatten)]
         kdf: KdfArgs,
     },
+    /// Encrypt a file into the vault
+    Add {
+        vault: PathBuf,
+        file: PathBuf,
+        /// Path inside the vault [default: the file's name]
+        #[arg(long = "as")]
+        dest: Option<String>,
+        /// Overwrite a file already at that path
+        #[arg(long)]
+        replace: bool,
+    },
+    /// List a directory in the vault [default: the root]
+    Ls { vault: PathBuf, dir: Option<String> },
+    /// Decrypt a file out of the vault
+    Get {
+        vault: PathBuf,
+        path: String,
+        /// Where to write it (`-` for stdout) [default: its name, in the
+        /// current directory]. Never overwrites.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Remove a file from the vault
+    Rm { vault: PathBuf, path: String },
     /// Check the password opens the vault (and time the KDF)
-    Unlock { path: PathBuf },
+    Unlock { vault: PathBuf },
     /// Change the password (asks for the current one)
-    Passwd { path: PathBuf },
+    Passwd { vault: PathBuf },
     /// Forgot a password: use the recovery key to set a new one
     ///
     /// --kdf-mib/--kdf-iters only apply if the vault has no password slot left
     /// to reset; otherwise the slot keeps its own KDF params.
     Recover {
-        path: PathBuf,
+        vault: PathBuf,
         /// Which password slot to reset, by id or label. Required only if
         /// the vault has more than one.
         #[arg(long)]
@@ -47,7 +75,7 @@ enum Cmd {
         kdf: KdfArgs,
     },
     /// Replace the recovery key; the old one stops working
-    RotateRecovery { path: PathBuf },
+    RotateRecovery { vault: PathBuf },
 }
 
 #[derive(clap::Args)]
@@ -85,15 +113,15 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.cmd {
-        Cmd::Init { path, kdf } => {
+        Cmd::Init { vault, kdf } => {
             let kdf = kdf.params()?;
             let pw = new_password()?;
             let started = Instant::now();
-            let (v, rk) = ops::init(&path, pw.as_bytes(), kdf)?;
+            let (s, rk) = store::init(&vault, pw.as_bytes(), kdf)?;
             eprintln!(
                 "created {} (id {})",
-                v.path().display(),
-                hex::encode(v.id())
+                s.root().display(),
+                hex::encode(s.vault().id())
             );
             eprintln!(
                 "KDF took {:?} (aim for ~1s; adjust --kdf-mib / --kdf-iters)",
@@ -101,19 +129,73 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             show_recovery_key(&rk);
         }
-        Cmd::Unlock { path } => {
-            let locked = LockedVault::read(&path)?;
-            let pw = prompt("Password: ")?;
+        Cmd::Add {
+            vault,
+            file,
+            dest,
+            replace,
+        } => {
+            let dest = match dest {
+                Some(d) => d,
+                None => file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or("can't use that file name in the vault; pass --as")?
+                    .to_owned(),
+            };
+            let src = BufReader::new(File::open(&file)?);
+            let mut s = open_store(&vault)?;
+            let size = s.add(&dest, src, replace)?;
+            eprintln!("added {dest} ({size} bytes)");
+        }
+        Cmd::Ls { vault, dir } => {
+            let s = open_store(&vault)?;
+            for item in s.list(dir.as_deref().unwrap_or(""))? {
+                match item {
+                    Listing::Dir { name } => println!("{:>12}  {name}/", ""),
+                    Listing::File { name, size } => println!("{size:>12}  {name}"),
+                }
+            }
+        }
+        Cmd::Get {
+            vault,
+            path,
+            output,
+        } => {
+            // Validated first, so the default name can't be `..` or similar.
+            let path = manifest::file_path(&path)?;
+            let output = match output {
+                Some(o) => o,
+                None => PathBuf::from(path.rsplit('/').next().expect("non-empty")),
+            };
+            let s = open_store(&vault)?;
+            if output == Path::new("-") {
+                // Can't take back what's already been written to a pipe: on
+                // error, the output so far is incomplete.
+                let mut out = std::io::stdout().lock();
+                s.get(&path, &mut out)?;
+                out.flush()?;
+            } else {
+                let size = s.get_to_file(&path, &output)?;
+                eprintln!("wrote {} ({size} bytes)", output.display());
+            }
+        }
+        Cmd::Rm { vault, path } => {
+            let mut s = open_store(&vault)?;
+            s.remove(&path)?;
+            eprintln!("removed {path}");
+        }
+        Cmd::Unlock { vault } => {
             let started = Instant::now();
-            let v = locked.unlock(&Credential::Password(pw.as_bytes()))?;
+            let v = unlock(&vault)?;
             eprintln!(
                 "unlocked {} in {:?}",
                 hex::encode(v.id()),
                 started.elapsed()
             );
         }
-        Cmd::Passwd { path } => {
-            let locked = LockedVault::read(&path)?;
+        Cmd::Passwd { vault } => {
+            let locked = LockedVault::read(store::header_path(&vault))?;
             let old = prompt("Current password: ")?;
             let mut v = locked.unlock(&Credential::Password(old.as_bytes()))?;
             // Only after the old password checked out.
@@ -122,14 +204,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ops::set_password(&mut v, id, new.as_bytes())?;
             eprintln!("password changed");
         }
-        Cmd::Recover { path, slot, kdf } => {
+        Cmd::Recover { vault, slot, kdf } => {
             let kdf = kdf.params()?;
             // A number is an id; anything else is a label.
             let choice = slot.as_deref().map(|s| match s.parse() {
                 Ok(n) => SlotRef::Id(SlotId(n)),
                 Err(_) => SlotRef::Label(s),
             });
-            let locked = LockedVault::read(&path)?;
+            let locked = LockedVault::read(store::header_path(&vault))?;
             let rk = RecoveryKey::parse(&prompt("Recovery key: ")?)?;
             let mut v = locked.unlock(&Credential::Recovery(&rk))?;
             // Settle the slot before asking for a new password, so a missing
@@ -148,16 +230,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "password reset. Your recovery key is unchanged; run rotate-recovery if it may have leaked."
             );
         }
-        Cmd::RotateRecovery { path } => {
-            let locked = LockedVault::read(&path)?;
-            let pw = prompt("Password: ")?;
-            let mut v = locked.unlock(&Credential::Password(pw.as_bytes()))?;
+        Cmd::RotateRecovery { vault } => {
+            let mut v = unlock(&vault)?;
             let rk = ops::rotate_recovery(&mut v)?;
             eprintln!("old recovery key no longer works");
             show_recovery_key(&rk);
         }
     }
     Ok(())
+}
+
+/// Read the header first, so a wrong path fails before the password prompt.
+fn unlock(vault: &Path) -> Result<Vault, Box<dyn std::error::Error>> {
+    let locked = LockedVault::read(store::header_path(vault))?;
+    let pw = prompt("Password: ")?;
+    Ok(locked.unlock(&Credential::Password(pw.as_bytes()))?)
+}
+
+fn open_store(vault: &Path) -> Result<Store, Box<dyn std::error::Error>> {
+    Ok(Store::open(vault, unlock(vault)?)?)
 }
 
 fn prompt(msg: &str) -> std::io::Result<Zeroizing<String>> {

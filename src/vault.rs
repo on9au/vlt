@@ -25,7 +25,7 @@ pub struct LockedVault {
 impl LockedVault {
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let bytes = fs::read_file(&path)?;
+        let bytes = fs::read_capped(&path, header::MAX_HEADER_LEN, Error::Corrupt)?;
         let header = header::decode(&bytes)?.header;
         Ok(Self {
             path,
