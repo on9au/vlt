@@ -4,6 +4,8 @@ pub mod crypto;
 pub mod error;
 pub mod fs;
 pub mod header;
+pub mod ops;
+pub mod slot;
 pub mod vault;
 
 #[cfg(test)]

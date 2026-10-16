@@ -38,6 +38,13 @@ pub enum Error {
     #[error("more than one password slot fits; choose one of: {0}")]
     SlotRequired(String),
 
-    #[error("no password slot with that index or label")]
+    #[error("no such slot")]
     NoSuchSlot,
+
+    #[error("that slot is the wrong kind for this operation")]
+    WrongSlotKind,
+
+    /// An edit would produce a header we'd refuse to read back.
+    #[error("{0}")]
+    Limit(&'static str),
 }

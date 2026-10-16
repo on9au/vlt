@@ -30,30 +30,58 @@ pub const MAX_LABEL_LEN: usize = 64;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Header {
     pub vault_id: [u8; 16],
+    /// Id the next new slot gets. Only ever goes up, so ids are never reused.
+    pub next_slot_id: SlotId,
     pub slots: Vec<KeySlot>,
 }
 
 impl Header {
-    /// Structural checks that don't need MK: slot counts, label lengths and
-    /// KDF bounds. Must run before any KDF does.
-    fn check(&self) -> Result<()> {
+    /// Structural checks that don't need MK: slot counts, unique ids, label
+    /// lengths and KDF bounds. Runs on every decode (before any KDF does) and
+    /// on every commit, so we never write what we'd refuse to read.
+    pub(crate) fn check(&self) -> Result<()> {
         let password_slots = self
             .slots
             .iter()
             .filter(|s| matches!(s.kind, SlotKind::Password { .. }))
             .count();
-        if self.slots.len() > MAX_SLOTS || password_slots > MAX_PASSWORD_SLOTS {
-            return Err(Error::Corrupt);
+        if self.slots.is_empty() {
+            return Err(Error::Limit("a vault needs at least one slot"));
         }
-        for slot in &self.slots {
+        if self.slots.len() > MAX_SLOTS {
+            return Err(Error::Limit("too many slots"));
+        }
+        if password_slots > MAX_PASSWORD_SLOTS {
+            return Err(Error::Limit("too many password slots"));
+        }
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.id >= self.next_slot_id || self.slots[..i].iter().any(|s| s.id == slot.id) {
+                return Err(Error::Limit("slot ids must be unique and issued"));
+            }
             if slot.label.as_ref().is_some_and(|l| l.len() > MAX_LABEL_LEN) {
-                return Err(Error::Corrupt);
+                return Err(Error::Limit("slot label too long"));
             }
             if let SlotKind::Password { kdf, .. } = &slot.kind {
                 kdf.check()?;
             }
         }
         Ok(())
+    }
+
+    pub fn slot(&self, id: SlotId) -> Option<&KeySlot> {
+        self.slots.iter().find(|s| s.id == id)
+    }
+}
+
+/// Stable slot id: survives edits to other slots and is never reused.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct SlotId(pub u16);
+
+impl std::fmt::Display for SlotId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -100,6 +128,7 @@ impl KdfParams {
 /// Keyslot
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KeySlot {
+    pub id: SlotId,
     /// Optional human label. Plaintext, and unauthenticated until the MAC check.
     pub label: Option<String>,
     /// Nonce for XChaCha20Poly1305
@@ -184,7 +213,11 @@ pub fn decode(bytes: &[u8]) -> Result<Unverified<'_>> {
     if !rest.is_empty() {
         return Err(Error::Corrupt);
     }
-    header.check()?;
+    // From disk, a broken limit just means a bad file.
+    header.check().map_err(|e| match e {
+        Error::Limit(_) => Error::Corrupt,
+        e => e,
+    })?;
     Ok(Unverified {
         header,
         signed,

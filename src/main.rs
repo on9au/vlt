@@ -5,8 +5,10 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use vlt::{
     crypto::RecoveryKey,
-    header::KdfParams,
-    vault::{SlotRef, Vault},
+    header::{KdfParams, SlotId},
+    ops::{self, SlotRef},
+    slot::Credential,
+    vault::LockedVault,
 };
 use zeroize::Zeroizing;
 
@@ -37,7 +39,7 @@ enum Cmd {
     /// to reset; otherwise the slot keeps its own KDF params.
     Recover {
         path: PathBuf,
-        /// Which password slot to reset, by index or label. Required only if
+        /// Which password slot to reset, by id or label. Required only if
         /// the vault has more than one.
         #[arg(long)]
         slot: Option<String>,
@@ -87,11 +89,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let kdf = kdf.params()?;
             let pw = new_password()?;
             let started = Instant::now();
-            let (v, rk) = Vault::init(&path, pw.as_bytes(), kdf)?;
+            let (v, rk) = ops::init(&path, pw.as_bytes(), kdf)?;
             eprintln!(
                 "created {} (id {})",
                 v.path().display(),
-                hex::encode(v.vault_id())
+                hex::encode(v.id())
             );
             eprintln!(
                 "KDF took {:?} (aim for ~1s; adjust --kdf-mib / --kdf-iters)",
@@ -100,40 +102,57 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             show_recovery_key(&rk);
         }
         Cmd::Unlock { path } => {
+            let locked = LockedVault::read(&path)?;
             let pw = prompt("Password: ")?;
             let started = Instant::now();
-            let v = Vault::unlock(&path, pw.as_bytes())?;
+            let v = locked.unlock(&Credential::Password(pw.as_bytes()))?;
             eprintln!(
                 "unlocked {} in {:?}",
-                hex::encode(v.vault_id()),
+                hex::encode(v.id()),
                 started.elapsed()
             );
         }
         Cmd::Passwd { path } => {
+            let locked = LockedVault::read(&path)?;
             let old = prompt("Current password: ")?;
+            let mut v = locked.unlock(&Credential::Password(old.as_bytes()))?;
+            // Only after the old password checked out.
             let new = new_password()?;
-            Vault::change_password(&path, old.as_bytes(), new.as_bytes())?;
+            let id = v.opened_by().expect("unlocked by a slot");
+            ops::set_password(&mut v, id, new.as_bytes())?;
             eprintln!("password changed");
         }
         Cmd::Recover { path, slot, kdf } => {
             let kdf = kdf.params()?;
-            // A number is an index; anything else is a label.
-            let slot = slot.as_deref().map(|s| match s.parse() {
-                Ok(i) => SlotRef::Index(i),
+            // A number is an id; anything else is a label.
+            let choice = slot.as_deref().map(|s| match s.parse() {
+                Ok(n) => SlotRef::Id(SlotId(n)),
                 Err(_) => SlotRef::Label(s),
             });
+            let locked = LockedVault::read(&path)?;
             let rk = RecoveryKey::parse(&prompt("Recovery key: ")?)?;
+            let mut v = locked.unlock(&Credential::Recovery(&rk))?;
+            // Settle the slot before asking for a new password, so a missing
+            // --slot doesn't waste the typing.
+            let target = ops::choose_password_slot(&v, choice)?;
             let new = new_password()?;
             let started = Instant::now();
-            Vault::recover(&path, &rk, new.as_bytes(), slot, kdf)?;
+            match target {
+                Some(id) => ops::set_password(&mut v, id, new.as_bytes())?,
+                None => {
+                    ops::add_password(&mut v, new.as_bytes(), kdf, None)?;
+                }
+            }
             eprintln!("KDF took {:?}", started.elapsed());
             eprintln!(
                 "password reset. Your recovery key is unchanged; run rotate-recovery if it may have leaked."
             );
         }
         Cmd::RotateRecovery { path } => {
+            let locked = LockedVault::read(&path)?;
             let pw = prompt("Password: ")?;
-            let (_v, rk) = Vault::rotate_recovery(&path, pw.as_bytes())?;
+            let mut v = locked.unlock(&Credential::Password(pw.as_bytes()))?;
+            let rk = ops::rotate_recovery(&mut v)?;
             eprintln!("old recovery key no longer works");
             show_recovery_key(&rk);
         }

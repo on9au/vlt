@@ -1,26 +1,71 @@
 //! Vault
+//!
+//! `LockedVault` (parsed, unverified) --unlock--> `Vault` (MK, verified)
+//! --edit--> `Edit` --commit--> disk. What the operations *mean* (change
+//! password, recover, ...) lives in `ops`.
 
 use std::path::{Path, PathBuf};
 
 use crate::{
     Error, Result,
-    crypto::{self, RecoveryKey, SecretKey, random_bytes, random_key},
+    crypto::{self, SecretKey, random_bytes, random_key},
     fs,
-    header::{self, Header, KdfParams, KeySlot, SlotKind},
+    header::{self, Header, KeySlot, SlotId},
+    slot::{self, Credential, NewSlot, SlotInfo},
 };
 
-/// Something the user presents to open a slot. Each slot kind accepts
-/// exactly one kind of credential.
-enum Credential<'a> {
-    Password(&'a [u8]),
-    Recovery(&'a RecoveryKey),
+/// A vault file that has been parsed but not unlocked. Nothing in it is
+/// authenticated yet: use it only to decide what to prompt for.
+pub struct LockedVault {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    header: Header,
 }
 
-/// Picks a slot: by its index in the header, or by its label.
-#[derive(Debug, Clone, Copy)]
-pub enum SlotRef<'a> {
-    Index(usize),
-    Label(&'a str),
+impl LockedVault {
+    pub fn read(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let bytes = fs::read_file(&path)?;
+        let header = header::decode(&bytes)?.header;
+        Ok(Self {
+            path,
+            bytes,
+            header,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// UNAUTHENTICATED: anyone can edit these. Fine for picking a prompt,
+    /// not for any decision that matters.
+    pub fn slots(&self) -> impl Iterator<Item = SlotInfo<'_>> {
+        self.header.slots.iter().map(SlotInfo::of)
+    }
+
+    /// Try every slot that accepts `cred`, then verify the header MAC before
+    /// trusting anything else in the header.
+    pub fn unlock(self, cred: &Credential) -> Result<Vault> {
+        let (opened_by, mk) = self
+            .header
+            .slots
+            .iter()
+            .find_map(|s| match slot::open(&self.header.vault_id, s, cred) {
+                Ok(Some(mk)) => Some(Ok((s.id, mk))),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .ok_or(Error::BadCredential)??;
+        let (signed, mac) = self.bytes.split_at(self.bytes.len() - header::MAC_LEN);
+        crypto::verify_header_mac(&mk, signed, mac)?;
+        Ok(Vault {
+            path: self.path,
+            header: self.header,
+            mk,
+            opened_by: Some(opened_by),
+        })
+    }
 }
 
 /// An unlocked vault. Holds MK in memory (zeroized)
@@ -28,6 +73,7 @@ pub struct Vault {
     path: PathBuf,
     header: Header,
     mk: SecretKey,
+    opened_by: Option<SlotId>,
 }
 
 impl std::fmt::Debug for Vault {
@@ -40,29 +86,28 @@ impl std::fmt::Debug for Vault {
 }
 
 impl Vault {
-    /// Create a new vault. Refuses to overwrite anything. The recovery key is
-    /// returned exactly once: if the caller drops it, it's gone.
-    pub fn init(
-        path: impl AsRef<Path>,
-        password: &[u8],
-        kdf: KdfParams,
-    ) -> Result<(Self, RecoveryKey)> {
-        kdf.check()?;
-        let path = path.as_ref().to_path_buf();
-        let recovery = RecoveryKey::generate();
+    /// Create a new vault with `slots`, refusing to overwrite anything.
+    pub fn create(path: impl AsRef<Path>, slots: &[NewSlot]) -> Result<Self> {
         let mut vault = Self {
-            path,
+            path: path.as_ref().to_path_buf(),
             header: Header {
                 vault_id: random_bytes(),
+                next_slot_id: SlotId(0),
                 slots: Vec::new(),
             },
             mk: random_key(),
+            opened_by: None,
         };
-        let pw_slot = vault.password_slot(password, kdf)?;
-        let rk_slot = vault.recovery_slot(&recovery);
-        vault.header.slots = vec![pw_slot, rk_slot];
-        fs::write_new(&vault.path, &vault.serialize(&vault.header))?;
-        Ok((vault, recovery))
+        let mut edit = vault.edit();
+        for new in slots {
+            edit.add(new, None)?;
+        }
+        let Edit { header, .. } = edit;
+        header.check()?;
+        let bytes = vault.serialize(&header);
+        fs::write_new(&vault.path, &bytes)?;
+        vault.header = header;
+        Ok(vault)
     }
 
     #[cfg(test)]
@@ -71,83 +116,11 @@ impl Vault {
             path: path.as_ref().to_path_buf(),
             header,
             mk,
+            opened_by: None,
         }
     }
 
-    pub fn unlock(path: impl AsRef<Path>, password: &[u8]) -> Result<Self> {
-        Self::open_with(path.as_ref(), &Credential::Password(password)).map(|(v, _)| v)
-    }
-
-    /// Requires the old password *every time*, never a cached one. An
-    /// unlocked session on its own is not enough to change credentials.
-    ///
-    /// Only the slot the old password opened is replaced; any other password
-    /// slots are left alone. The new slot keeps that slot's label and KDF params.
-    pub fn change_password(path: impl AsRef<Path>, old: &[u8], new: &[u8]) -> Result<Self> {
-        let (mut vault, i) = Self::open_with(path.as_ref(), &Credential::Password(old))?;
-        vault.reset_password_slot(i, new)?;
-        Ok(vault)
-    }
-
-    /// Forgot a password: open with the recovery key and give one password
-    /// slot a new password, keeping its label and KDF params. Other password
-    /// slots are left alone. The recovery key stays valid (rotate it
-    /// separately if it leaked).
-    ///
-    /// `slot` may be omitted when there's exactly one password slot. If there
-    /// are none, a new one is added with `kdf`, which is otherwise unused.
-    pub fn recover(
-        path: impl AsRef<Path>,
-        recovery: &RecoveryKey,
-        new_password: &[u8],
-        slot: Option<SlotRef>,
-        kdf: KdfParams,
-    ) -> Result<Self> {
-        let (mut vault, _) = Self::open_with(path.as_ref(), &Credential::Recovery(recovery))?;
-        let candidates: Vec<usize> = (0..vault.header.slots.len())
-            .filter(|&i| matches!(vault.header.slots[i].kind, SlotKind::Password { .. }))
-            .collect();
-        let i = match (slot, candidates.as_slice()) {
-            (None, []) => {
-                kdf.check()?;
-                let slot = vault.password_slot(new_password, kdf)?;
-                let mut header = vault.header.clone();
-                header.slots.push(slot);
-                vault.persist(header)?;
-                return Ok(vault);
-            }
-            (None, [i]) => *i,
-            (None, _) => return Err(vault.slot_required(&candidates)),
-            (Some(SlotRef::Index(i)), _) if candidates.contains(&i) => i,
-            (Some(SlotRef::Index(_)), _) => return Err(Error::NoSuchSlot),
-            (Some(SlotRef::Label(label)), _) => {
-                let matching: Vec<usize> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|&i| vault.header.slots[i].label.as_deref() == Some(label))
-                    .collect();
-                match matching.as_slice() {
-                    [i] => *i,
-                    [] => return Err(Error::NoSuchSlot),
-                    _ => return Err(vault.slot_required(&matching)),
-                }
-            }
-        };
-        vault.reset_password_slot(i, new_password)?;
-        Ok(vault)
-    }
-
-    /// Lost the paper, or think someone saw it: issue a new recovery key.
-    /// The old one stops working immediately.
-    pub fn rotate_recovery(path: impl AsRef<Path>, password: &[u8]) -> Result<(Self, RecoveryKey)> {
-        let mut vault = Self::unlock(path, password)?;
-        let recovery = RecoveryKey::generate();
-        let slot = vault.recovery_slot(&recovery);
-        vault.replace_all(slot)?;
-        Ok((vault, recovery))
-    }
-
-    pub fn vault_id(&self) -> [u8; 16] {
+    pub fn id(&self) -> [u8; 16] {
         self.header.vault_id
     }
 
@@ -155,20 +128,27 @@ impl Vault {
         &self.path
     }
 
-    /// Read the file, unwrap MK through a slot that accepts `cred`, then
-    /// verify the header MAC before trusting anything else in the header.
-    /// Also returns the index of the slot that opened.
-    fn open_with(path: &Path, cred: &Credential) -> Result<(Self, usize)> {
-        let bytes = fs::read_file(path)?;
-        let raw = header::decode(&bytes)?;
-        let (i, mk) = unwrap_mk(&raw.header, cred)?;
-        crypto::verify_header_mac(&mk, raw.signed, raw.mac)?;
-        let vault = Self {
-            path: path.to_path_buf(),
-            header: raw.header,
-            mk,
-        };
-        Ok((vault, i))
+    pub fn slots(&self) -> impl Iterator<Item = SlotInfo<'_>> {
+        self.header.slots.iter().map(SlotInfo::of)
+    }
+
+    pub fn slot(&self, id: SlotId) -> Option<SlotInfo<'_>> {
+        self.header.slot(id).map(SlotInfo::of)
+    }
+
+    /// The slot whose credential unlocked this vault. `None` for a vault
+    /// you just created.
+    pub fn opened_by(&self) -> Option<SlotId> {
+        self.opened_by
+    }
+
+    /// Stage slot changes. Nothing touches the disk (or `self`) until
+    /// `Edit::commit`.
+    pub fn edit(&mut self) -> Edit<'_> {
+        Edit {
+            header: self.header.clone(),
+            vault: self,
+        }
     }
 
     #[cfg(test)]
@@ -183,109 +163,70 @@ impl Vault {
         out
     }
 
-    fn password_slot(&self, password: &[u8], kdf: KdfParams) -> Result<KeySlot> {
-        let salt = random_bytes();
-        let kek = crypto::password_kek(password, &salt, &kdf)?;
-        Ok(self.wrap(SlotKind::Password { salt, kdf }, &kek))
-    }
-
-    fn recovery_slot(&self, recovery: &RecoveryKey) -> KeySlot {
-        let salt = random_bytes();
-        let kek = crypto::recovery_kek(recovery, &salt);
-        self.wrap(SlotKind::Recovery { salt }, &kek)
-    }
-
-    fn wrap(&self, kind: SlotKind, kek: &SecretKey) -> KeySlot {
-        let nonce = random_bytes();
-        let aad = KeySlot::aad(&self.header.vault_id, &kind);
-        let (wrapped_mk, tag) = crypto::wrap_key(kek, &nonce, &aad, &self.mk);
-        KeySlot {
-            label: None,
-            nonce,
-            wrapped_mk,
-            tag,
-            kind,
-        }
-    }
-
-    /// Give password slot `i` a new password, in place, keeping its label and
-    /// KDF params.
-    fn reset_password_slot(&mut self, i: usize, password: &[u8]) -> Result<()> {
-        let old = &self.header.slots[i];
-        let SlotKind::Password { kdf, .. } = old.kind else {
-            unreachable!("only called with password slots")
-        };
-        let mut slot = self.password_slot(password, kdf)?;
-        slot.label = old.label.clone();
-        let mut header = self.header.clone();
-        header.slots[i] = slot;
-        self.persist(header)
-    }
-
-    /// Lists `candidates` so the user can pick one. Only called after the MAC
-    /// check, so the labels are authentic.
-    fn slot_required(&self, candidates: &[usize]) -> Error {
-        let choices = candidates
-            .iter()
-            .map(|&i| match &self.header.slots[i].label {
-                Some(label) => format!("{i} ({label:?})"),
-                None => format!("{i} (no label)"),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        Error::SlotRequired(choices)
-    }
-
-    /// Replace every slot of the same kind with `slot` and persist atomically.
-    fn replace_all(&mut self, slot: KeySlot) -> Result<()> {
-        let mut header = self.header.clone();
-        header
-            .slots
-            .retain(|s| std::mem::discriminant(&s.kind) != std::mem::discriminant(&slot.kind));
-        header.slots.push(slot);
-        self.persist(header)
-    }
-
-    // TODO: no file lock around read-modify-write. Two concurrent
-    // passwd/rotate-recovery runs both succeed and the last write wins.
-    fn persist(&mut self, header: Header) -> Result<()> {
-        fs::replace_file(&self.path, &self.serialize(&header))?;
-        // Only update in-memory state once the disk write succeeded.
-        self.header = header;
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn mk(&self) -> &[u8; crypto::KEY_LEN] {
         &self.mk
     }
 }
 
-/// The KEK for `kind`, or `None` if that kind of slot doesn't take `cred`.
-fn slot_kek(kind: &SlotKind, cred: &Credential) -> Option<Result<SecretKey>> {
-    match (kind, cred) {
-        (SlotKind::Password { salt, kdf }, Credential::Password(pw)) => {
-            Some(crypto::password_kek(pw, salt, kdf))
-        }
-        (SlotKind::Recovery { salt }, Credential::Recovery(rk)) => {
-            Some(Ok(crypto::recovery_kek(rk, salt)))
-        }
-        _ => None,
-    }
+/// Staged slot changes, written in one atomic step by `commit`.
+#[must_use = "edits are discarded unless committed"]
+pub struct Edit<'v> {
+    vault: &'v mut Vault,
+    header: Header,
 }
 
-/// Try every slot that accepts `cred`. Returns the index of the one that
-/// opened along with MK.
-fn unwrap_mk(header: &Header, cred: &Credential) -> Result<(usize, SecretKey)> {
-    for (i, slot) in header.slots.iter().enumerate() {
-        let Some(kek) = slot_kek(&slot.kind, cred) else {
-            continue;
-        };
-        let aad = KeySlot::aad(&header.vault_id, &slot.kind);
-        if let Some(mk) = crypto::unwrap_key(&kek?, &slot.nonce, &aad, &slot.wrapped_mk, &slot.tag)
-        {
-            return Ok((i, mk));
-        }
+impl Edit<'_> {
+    pub fn add(&mut self, new: &NewSlot, label: Option<String>) -> Result<SlotId> {
+        let id = self.header.next_slot_id;
+        let next = id.0.checked_add(1).ok_or(Error::Limit("out of slot ids"))?;
+        let slot = self.seal(id, label, new)?;
+        self.header.slots.push(slot);
+        self.header.next_slot_id = SlotId(next);
+        Ok(id)
     }
-    Err(Error::BadCredential)
+
+    /// New secret, same id and label. May change the slot's kind.
+    pub fn replace(&mut self, id: SlotId, new: &NewSlot) -> Result<()> {
+        let i = self.index(id)?;
+        let label = self.header.slots[i].label.clone();
+        self.header.slots[i] = self.seal(id, label, new)?;
+        Ok(())
+    }
+
+    pub fn remove(&mut self, id: SlotId) -> Result<()> {
+        let i = self.index(id)?;
+        self.header.slots.remove(i);
+        Ok(())
+    }
+
+    pub fn set_label(&mut self, id: SlotId, label: Option<String>) -> Result<()> {
+        let i = self.index(id)?;
+        self.header.slots[i].label = label;
+        Ok(())
+    }
+
+    /// Check the result is a header we'd accept on read, write it
+    /// atomically, and only then update the in-memory vault.
+    // TODO: no file lock around read-modify-write. Two concurrent edits both
+    // succeed and the last write wins.
+    pub fn commit(self) -> Result<()> {
+        let Edit { vault, header } = self;
+        header.check()?;
+        fs::replace_file(&vault.path, &vault.serialize(&header))?;
+        vault.header = header;
+        Ok(())
+    }
+
+    fn index(&self, id: SlotId) -> Result<usize> {
+        self.header
+            .slots
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or(Error::NoSuchSlot)
+    }
+
+    fn seal(&self, id: SlotId, label: Option<String>, new: &NewSlot) -> Result<KeySlot> {
+        slot::seal(&self.header.vault_id, &self.vault.mk, id, label, new)
+    }
 }
