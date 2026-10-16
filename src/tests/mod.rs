@@ -15,6 +15,8 @@ use crate::{
 
 use tempfile::TempDir;
 
+mod object;
+
 const KDF: KdfParams = KdfParams::INSECURE_TEST;
 
 fn setup() -> (TempDir, PathBuf) {

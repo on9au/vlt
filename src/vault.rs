@@ -142,6 +142,12 @@ impl Vault {
         self.opened_by
     }
 
+    /// A subkey of MK for one purpose. MK itself never leaves `Vault`; every
+    /// consumer gets its own key, so no two primitives ever share one.
+    pub(crate) fn derive_key(&self, info: &[&[u8]]) -> SecretKey {
+        crypto::subkey(&self.mk, info)
+    }
+
     /// Stage slot changes. Nothing touches the disk (or `self`) until
     /// `Edit::commit`.
     pub fn edit(&mut self) -> Edit<'_> {

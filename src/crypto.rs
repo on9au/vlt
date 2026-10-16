@@ -120,12 +120,9 @@ pub fn header_mac(mk: &SecretKey, signed: &[u8]) -> [u8; 32] {
 /// Separate subkey for the header MAC, so MK itself is only ever used as
 /// input to HKDF and to wrap item keys.
 fn header_mac_key(mk: &SecretKey) -> SecretKey {
-    let hk = Hkdf::<Sha256>::from_prk(mk.as_ref()).expect("32-byte PRK is valid");
-    let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    hk.expand(b"vlt v1 header mac", out.as_mut())
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    out
+    subkey(mk, &[b"vlt v1 header mac"])
 }
+
 /// Constant-time comparison.
 pub fn verify_header_mac(mk: &SecretKey, signed: &[u8], mac: &[u8]) -> Result<()> {
     use hmac::Mac;
@@ -133,6 +130,44 @@ pub fn verify_header_mac(mk: &SecretKey, signed: &[u8], mac: &[u8]) -> Result<()
         HmacSha256::new_from_slice(header_mac_key(mk).as_ref()).expect("any key length works");
     m.update(signed);
     m.verify_slice(mac).map_err(|_| Error::Tampered)
+}
+
+/// HKDF-Expand with MK as the PRK. `info` parts are concatenated; the first
+/// one is always a fixed `vlt v1 ...` label, so purposes can't collide.
+pub fn subkey(mk: &SecretKey, info: &[&[u8]]) -> SecretKey {
+    let hk = Hkdf::<Sha256>::from_prk(mk.as_ref()).expect("32-byte PRK is valid");
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    hk.expand_multi_info(info, out.as_mut())
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
+}
+
+/// Encrypts `buf` in place and returns the tag.
+pub fn seal_in_place(
+    key: &SecretKey,
+    nonce: &[u8; 24],
+    aad: &[u8],
+    buf: &mut [u8],
+) -> [u8; TAG_LEN] {
+    XChaCha20Poly1305::new((&**key).into())
+        .encrypt_inout_detached(nonce.into(), aad, buf.into())
+        .expect("XChaCha20-Poly1305 encryption of an in-memory buffer cannot fail")
+        .into()
+}
+
+/// Decrypts `buf` in place. `false` on authentication failure, in which case
+/// `buf` holds garbage and must not be used.
+#[must_use]
+pub fn open_in_place(
+    key: &SecretKey,
+    nonce: &[u8; 24],
+    aad: &[u8],
+    buf: &mut [u8],
+    tag: &[u8; TAG_LEN],
+) -> bool {
+    XChaCha20Poly1305::new((&**key).into())
+        .decrypt_inout_detached(nonce.into(), aad, buf.into(), tag.into())
+        .is_ok()
 }
 
 /// Encrypts a key under `kek`, tag kept separate so both halves are fixed-size.
@@ -143,10 +178,8 @@ pub fn wrap_key(
     key: &SecretKey,
 ) -> ([u8; KEY_LEN], [u8; TAG_LEN]) {
     let mut buf = **key;
-    let tag = XChaCha20Poly1305::new((&**kek).into())
-        .encrypt_inout_detached(nonce.into(), aad, buf.as_mut_slice().into())
-        .expect("XChaCha20-Poly1305 encryption of an in-memory buffer cannot fail");
-    (buf, tag.into())
+    let tag = seal_in_place(kek, nonce, aad, &mut buf);
+    (buf, tag)
 }
 
 /// `None` on authentication failure: wrong KEK, or the slot was modified.
@@ -158,10 +191,7 @@ pub fn unwrap_key(
     tag: &[u8; TAG_LEN],
 ) -> Option<SecretKey> {
     let mut key = Zeroizing::new(*wrapped);
-    XChaCha20Poly1305::new((&**kek).into())
-        .decrypt_inout_detached(nonce.into(), aad, key.as_mut_slice().into(), tag.into())
-        .ok()?;
-    Some(key)
+    open_in_place(kek, nonce, aad, key.as_mut(), tag).then_some(key)
 }
 
 pub fn seal(key: &SecretKey, nonce: &[u8; 24], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {

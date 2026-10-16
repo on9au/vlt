@@ -30,6 +30,11 @@ pub enum Error {
     #[error("malformed recovery key")]
     BadRecoveryKey,
 
+    /// Wrong id, truncated, reordered, spliced or modified: from the crypto's
+    /// point of view these are all the same.
+    #[error("encrypted object is corrupt or was modified")]
+    BadObject,
+
     #[error("a file already exists at that path")]
     AlreadyExists,
 
