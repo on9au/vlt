@@ -9,6 +9,8 @@ use std::{
 
 use crate::{Error, Result, header};
 
+// TODO: TOCTOU between the metadata check and the read; the file can grow in
+// between. Read through `File::take(MAX_HEADER_LEN + 1)` and check the length.
 pub fn read_file(path: &Path) -> Result<Vec<u8>> {
     if fs::metadata(path)?.len() > header::MAX_HEADER_LEN {
         return Err(Error::Corrupt);

@@ -164,6 +164,8 @@ impl Vault {
     }
 
     /// Swap in a new slot of the same kind and persist atomically.
+    // TODO: no file lock around read-modify-write. Two concurrent
+    // passwd/rotate-recovery runs both succeed and the last write wins.
     fn replace_slot(&mut self, slot: KeySlot) -> Result<()> {
         let mut header = self.header.clone();
         header.slots.retain(|s| s.kind != slot.kind);
