@@ -2,7 +2,7 @@
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::XChaCha20Poly1305;
-use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::aead::{Aead, AeadInOut, Payload};
 use hkdf::Hkdf;
 use hmac::KeyInit;
 use rand::{TryRng, rngs::SysRng};
@@ -13,6 +13,7 @@ use crate::header::KdfParams;
 use crate::{Error, Result};
 
 pub const KEY_LEN: usize = 32;
+pub const TAG_LEN: usize = 16;
 
 pub type SecretKey = Zeroizing<[u8; KEY_LEN]>;
 type HmacSha256 = hmac::Hmac<Sha256>;
@@ -132,6 +133,35 @@ pub fn verify_header_mac(mk: &SecretKey, signed: &[u8], mac: &[u8]) -> Result<()
         HmacSha256::new_from_slice(header_mac_key(mk).as_ref()).expect("any key length works");
     m.update(signed);
     m.verify_slice(mac).map_err(|_| Error::Tampered)
+}
+
+/// Encrypts a key under `kek`, tag kept separate so both halves are fixed-size.
+pub fn wrap_key(
+    kek: &SecretKey,
+    nonce: &[u8; 24],
+    aad: &[u8],
+    key: &SecretKey,
+) -> ([u8; KEY_LEN], [u8; TAG_LEN]) {
+    let mut buf = **key;
+    let tag = XChaCha20Poly1305::new((&**kek).into())
+        .encrypt_inout_detached(nonce.into(), aad, buf.as_mut_slice().into())
+        .expect("XChaCha20-Poly1305 encryption of an in-memory buffer cannot fail");
+    (buf, tag.into())
+}
+
+/// `None` on authentication failure: wrong KEK, or the slot was modified.
+pub fn unwrap_key(
+    kek: &SecretKey,
+    nonce: &[u8; 24],
+    aad: &[u8],
+    wrapped: &[u8; KEY_LEN],
+    tag: &[u8; TAG_LEN],
+) -> Option<SecretKey> {
+    let mut key = Zeroizing::new(*wrapped);
+    XChaCha20Poly1305::new((&**kek).into())
+        .decrypt_inout_detached(nonce.into(), aad, key.as_mut_slice().into(), tag.into())
+        .ok()?;
+    Some(key)
 }
 
 pub fn seal(key: &SecretKey, nonce: &[u8; 24], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {

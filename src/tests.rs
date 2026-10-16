@@ -5,13 +5,14 @@ use std::{
 
 use crate::{
     Error,
-    crypto::{RecoveryKey, random_key},
+    crypto::{self, RecoveryKey, random_key},
     fs,
-    header::{self, Header, KdfParams, SlotKind},
-    vault::Vault,
+    header::{self, Header, KdfParams, KeySlot, SlotKind},
+    vault::{SlotRef, Vault},
 };
 
 use tempfile::TempDir;
+use zeroize::Zeroizing;
 
 const KDF: KdfParams = KdfParams::INSECURE_TEST;
 
@@ -35,6 +36,182 @@ fn store_unsigned(p: &Path, h: &Header) {
     let mut out = header::encode_unsigned(h);
     out.extend_from_slice(&[0u8; header::MAC_LEN]);
     stdfs::write(p, out).unwrap();
+}
+
+fn password_slot(h: &mut Header) -> &mut KeySlot {
+    h.slots
+        .iter_mut()
+        .find(|s| matches!(s.kind, SlotKind::Password { .. }))
+        .unwrap()
+}
+
+/// Add a second password slot the way a future `add-password` would, and
+/// re-sign the header with the real MK.
+fn add_password_slot(p: &Path, v: &Vault, password: &[u8], label: &str, kdf: KdfParams) {
+    let mut h = load(p);
+    let salt = crypto::random_bytes();
+    let kek = crypto::password_kek(password, &salt, &kdf).unwrap();
+    let kind = SlotKind::Password { salt, kdf };
+    let nonce = crypto::random_bytes();
+    let aad = KeySlot::aad(&h.vault_id, &kind);
+    let mk = Zeroizing::new(mk(v));
+    let (wrapped_mk, tag) = crypto::wrap_key(&kek, &nonce, &aad, &mk);
+    h.slots.push(KeySlot {
+        label: Some(label.into()),
+        nonce,
+        wrapped_mk,
+        tag,
+        kind,
+    });
+    let signer = Vault::new_test(p, h.clone(), mk);
+    stdfs::write(p, signer.serialize_test(&h)).unwrap();
+}
+
+#[test]
+fn second_password_slot_unlocks_and_change_password_only_touches_its_own() {
+    let (_d, p) = setup();
+    let (v, rk) = Vault::init(&p, b"first", KDF).unwrap();
+    add_password_slot(&p, &v, b"second", "laptop", KDF);
+    assert_eq!(mk(&Vault::unlock(&p, b"first").unwrap()), mk(&v));
+    assert_eq!(mk(&Vault::unlock(&p, b"second").unwrap()), mk(&v));
+
+    Vault::change_password(&p, b"second", b"second2").unwrap();
+    Vault::unlock(&p, b"first").unwrap();
+    Vault::unlock(&p, b"second2").unwrap();
+    assert!(Vault::unlock(&p, b"second").is_err());
+    let labels: Vec<_> = load(&p).slots.into_iter().filter_map(|s| s.label).collect();
+    assert_eq!(labels, ["laptop"], "label must survive a password change");
+
+    // Recovery replaces exactly the chosen slot.
+    Vault::recover(&p, &rk, b"fresh", Some(SlotRef::Label("laptop")), KDF).unwrap();
+    Vault::unlock(&p, b"first").unwrap();
+    Vault::unlock(&p, b"fresh").unwrap();
+    assert!(Vault::unlock(&p, b"second2").is_err());
+}
+
+#[test]
+fn recover_with_several_password_slots_needs_a_choice() {
+    let (_d, p) = setup();
+    let (v, rk) = Vault::init(&p, b"first", KDF).unwrap();
+    let slower = KdfParams {
+        time_cost: 2,
+        ..KDF
+    };
+    add_password_slot(&p, &v, b"second", "laptop", slower);
+    let before = stdfs::read(&p).unwrap();
+
+    // No guessing: refuse, list the choices, write nothing.
+    match Vault::recover(&p, &rk, b"x", None, KDF) {
+        Err(Error::SlotRequired(choices)) => {
+            assert_eq!(choices, r#"0 (no label), 2 ("laptop")"#)
+        }
+        other => panic!("expected SlotRequired, got {other:?}"),
+    }
+    for bad in [SlotRef::Index(1), SlotRef::Index(9), SlotRef::Label("nope")] {
+        assert!(matches!(
+            Vault::recover(&p, &rk, b"x", Some(bad), KDF),
+            Err(Error::NoSuchSlot)
+        ));
+    }
+    assert_eq!(before, stdfs::read(&p).unwrap());
+
+    // By index: only slot 2 changes, and it keeps its label and KDF params.
+    Vault::recover(&p, &rk, b"fresh", Some(SlotRef::Index(2)), KDF).unwrap();
+    Vault::unlock(&p, b"first").unwrap();
+    Vault::unlock(&p, b"fresh").unwrap();
+    assert!(Vault::unlock(&p, b"second").is_err());
+    let slot = &load(&p).slots[2];
+    assert_eq!(slot.label.as_deref(), Some("laptop"));
+    assert!(matches!(slot.kind, SlotKind::Password { kdf, .. } if kdf == slower));
+}
+
+#[test]
+fn recover_with_no_password_slot_adds_one() {
+    let (_d, p) = setup();
+    let (v, rk) = Vault::init(&p, b"pw", KDF).unwrap();
+    let mut h = load(&p);
+    h.slots
+        .retain(|s| !matches!(s.kind, SlotKind::Password { .. }));
+    let signer = Vault::new_test(&p, h.clone(), Zeroizing::new(mk(&v)));
+    stdfs::write(&p, signer.serialize_test(&h)).unwrap();
+
+    let chosen = KdfParams {
+        time_cost: 2,
+        ..KDF
+    };
+    Vault::recover(&p, &rk, b"fresh", None, chosen).unwrap();
+    assert_eq!(mk(&Vault::unlock(&p, b"fresh").unwrap()), mk(&v));
+    assert!(matches!(
+        password_slot(&mut load(&p)).kind,
+        SlotKind::Password { kdf, .. } if kdf == chosen
+    ));
+}
+
+#[test]
+fn too_many_password_slots_rejected_before_running_argon() {
+    let (_d, p) = setup();
+    Vault::init(&p, b"pw", KDF).unwrap();
+    let mut h = load(&p);
+    let mut slot = password_slot(&mut h).clone();
+    // Absurd params too: if any slot reached Argon2 the test would OOM.
+    if let SlotKind::Password { kdf, .. } = &mut slot.kind {
+        kdf.mem_cost_kib = 4 * 1024 * 1024;
+        kdf.time_cost = 64;
+    }
+    h.slots
+        .extend(std::iter::repeat_n(slot, header::MAX_PASSWORD_SLOTS));
+    store_unsigned(&p, &h);
+    assert!(matches!(Vault::unlock(&p, b"pw"), Err(Error::Corrupt)));
+}
+
+#[test]
+fn too_many_slots_and_long_labels_rejected() {
+    let (_d, p) = setup();
+    Vault::init(&p, b"pw", KDF).unwrap();
+    let good = load(&p);
+
+    let mut h = good.clone();
+    let recovery = h
+        .slots
+        .iter()
+        .find(|s| matches!(s.kind, SlotKind::Recovery { .. }));
+    let recovery = recovery.unwrap().clone();
+    h.slots
+        .extend(std::iter::repeat_n(recovery, header::MAX_SLOTS));
+    store_unsigned(&p, &h);
+    assert!(matches!(Vault::unlock(&p, b"pw"), Err(Error::Corrupt)));
+
+    let mut h = good;
+    password_slot(&mut h).label = Some("x".repeat(header::MAX_LABEL_LEN + 1));
+    store_unsigned(&p, &h);
+    assert!(matches!(Vault::unlock(&p, b"pw"), Err(Error::Corrupt)));
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_temp_file_is_not_followed_or_inherited() {
+    use std::os::unix::fs::PermissionsExt;
+    let (d, p) = setup();
+    Vault::init(&p, b"pw", KDF).unwrap();
+    let tmp = fs::tmp_path(&p);
+
+    // A planted symlink must not redirect the write.
+    let victim = d.path().join("victim");
+    stdfs::write(&victim, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+    Vault::change_password(&p, b"pw", b"pw2").unwrap();
+    assert_eq!(stdfs::read(&victim).unwrap(), b"untouched");
+    Vault::unlock(&p, b"pw2").unwrap();
+
+    // A leftover world-readable temp must not hand its mode to the vault.
+    stdfs::write(&tmp, b"stale").unwrap();
+    stdfs::set_permissions(&tmp, stdfs::Permissions::from_mode(0o644)).unwrap();
+    Vault::change_password(&p, b"pw2", b"pw3").unwrap();
+    assert_eq!(
+        stdfs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!tmp.exists());
 }
 
 #[test]
@@ -94,7 +271,7 @@ fn change_password_keeps_mk_and_recovery() {
     assert_eq!(mk(&Vault::unlock(&p, b"new").unwrap()), original);
 
     // Recovery key still works after a password change.
-    let v3 = Vault::recover(&p, &rk, b"newer").unwrap();
+    let v3 = Vault::recover(&p, &rk, b"newer", None, KDF).unwrap();
     assert_eq!(mk(&v3), original);
 }
 
@@ -103,7 +280,7 @@ fn recover_resets_password() {
     let (_d, p) = setup();
     let (v, rk) = Vault::init(&p, b"forgotten", KDF).unwrap();
     let rk = RecoveryKey::parse(&rk.reveal()).unwrap(); // round-trip through the printed form
-    Vault::recover(&p, &rk, b"fresh").unwrap();
+    Vault::recover(&p, &rk, b"fresh", None, KDF).unwrap();
     assert!(matches!(
         Vault::unlock(&p, b"forgotten"),
         Err(Error::BadCredential)
@@ -117,7 +294,7 @@ fn wrong_recovery_key_fails() {
     Vault::init(&p, b"pw", KDF).unwrap();
     let bogus = RecoveryKey::generate();
     assert!(matches!(
-        Vault::recover(&p, &bogus, b"x"),
+        Vault::recover(&p, &bogus, b"x", None, KDF),
         Err(Error::BadCredential)
     ));
     // And the password slot must be untouched by the failed attempt.
@@ -130,10 +307,10 @@ fn rotate_recovery_kills_old_key() {
     let (_v, old_rk) = Vault::init(&p, b"pw", KDF).unwrap();
     let (_v, new_rk) = Vault::rotate_recovery(&p, b"pw").unwrap();
     assert!(matches!(
-        Vault::recover(&p, &old_rk, b"x"),
+        Vault::recover(&p, &old_rk, b"x", None, KDF),
         Err(Error::BadCredential)
     ));
-    Vault::recover(&p, &new_rk, b"x").unwrap();
+    Vault::recover(&p, &new_rk, b"x", None, KDF).unwrap();
 }
 
 #[test]
@@ -167,9 +344,9 @@ fn tampering_with_the_other_slot_is_caught() {
     let s = h
         .slots
         .iter_mut()
-        .find(|s| s.kind == SlotKind::Recovery)
+        .find(|s| matches!(s.kind, SlotKind::Recovery { .. }))
         .unwrap();
-    s.encrypted_mk[0] ^= 1;
+    s.wrapped_mk[0] ^= 1;
     // Re-sign with a *wrong* MK to prove the MAC is keyed, not just a checksum.
     let fake = Vault::new_test(p.clone(), h.clone(), random_key());
     stdfs::write(&p, fake.serialize_test(&h)).unwrap();
@@ -180,17 +357,16 @@ fn tampering_with_the_other_slot_is_caught() {
     let (_v, rk2) = Vault::init(&p2, b"pw", KDF).unwrap();
     let mut bytes = stdfs::read(&p2).unwrap();
     let mut h2 = header::decode(&bytes).unwrap().header;
-    h2.slots
-        .iter_mut()
-        .find(|s| s.kind == SlotKind::Password)
-        .unwrap()
-        .salt[0] ^= 1;
+    let SlotKind::Password { salt, .. } = &mut password_slot(&mut h2).kind else {
+        unreachable!()
+    };
+    salt[0] ^= 1;
     let mac = bytes.split_off(bytes.len() - header::MAC_LEN); // keep the old, now-stale MAC
     let mut out = header::encode_unsigned(&h2);
     out.extend_from_slice(&mac);
     stdfs::write(&p2, out).unwrap();
     assert!(matches!(
-        Vault::recover(&p2, &rk2, b"x"),
+        Vault::recover(&p2, &rk2, b"x", None, KDF),
         Err(Error::Tampered)
     ));
 }
@@ -206,11 +382,12 @@ fn keyslot_from_another_vault_is_rejected() {
 
     let mut a = load(&pa);
     let b = load(&pb);
-    a.slots.retain(|s| s.kind != SlotKind::Password);
+    a.slots
+        .retain(|s| !matches!(s.kind, SlotKind::Password { .. }));
     a.slots.push(
         b.slots
             .iter()
-            .find(|s| s.kind == SlotKind::Password)
+            .find(|s| matches!(s.kind, SlotKind::Password { .. }))
             .unwrap()
             .clone(),
     );
@@ -229,13 +406,13 @@ fn relabelled_slot_is_rejected() {
     let mut h = load(&p);
     for s in &mut h.slots {
         s.kind = match s.kind {
-            SlotKind::Password => SlotKind::Recovery,
-            SlotKind::Recovery => SlotKind::Password,
+            SlotKind::Password { salt, .. } => SlotKind::Recovery { salt },
+            SlotKind::Recovery { salt } => SlotKind::Password { salt, kdf: KDF },
         };
     }
     store_unsigned(&p, &h);
     assert!(Vault::unlock(&p, b"pw").is_err());
-    assert!(Vault::recover(&p, &rk, b"x").is_err());
+    assert!(Vault::recover(&p, &rk, b"x", None, KDF).is_err());
 }
 
 #[test]
@@ -243,7 +420,10 @@ fn absurd_kdf_params_rejected_before_running_argon() {
     let (_d, p) = setup();
     Vault::init(&p, b"pw", KDF).unwrap();
     let mut h = load(&p);
-    h.kdf.mem_cost_kib = u32::MAX; // ~4 TB. If this ran, the test would OOM.
+    let SlotKind::Password { kdf, .. } = &mut password_slot(&mut h).kind else {
+        unreachable!()
+    };
+    kdf.mem_cost_kib = u32::MAX; // ~4 TB. If this ran, the test would OOM.
     store_unsigned(&p, &h);
     assert!(matches!(Vault::unlock(&p, b"pw"), Err(Error::BadKdfParams)));
 }

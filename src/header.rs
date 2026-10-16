@@ -18,14 +18,46 @@ pub const MAX_HEADER_LEN: u64 = 64 * 1024; // 64 KiB
 
 pub const MAC_LEN: usize = 32;
 
+/// Upper bound on slots of any kind, as a sanity limit.
+pub const MAX_SLOTS: usize = 16;
+/// Upper bound on Argon2id-backed slots. Every one of them is tried on unlock,
+/// *before* the MAC can be checked, so this bounds the work someone who can
+/// edit the file can force on us.
+pub const MAX_PASSWORD_SLOTS: usize = 4;
+/// Upper bound on a slot label, in bytes.
+pub const MAX_LABEL_LEN: usize = 64;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Header {
     pub vault_id: [u8; 16],
-    pub kdf: KdfParams,
     pub slots: Vec<KeySlot>,
 }
 
-/// Argon2id params, stored in the header so they can be raised later without breaking compat.
+impl Header {
+    /// Structural checks that don't need MK: slot counts, label lengths and
+    /// KDF bounds. Must run before any KDF does.
+    fn check(&self) -> Result<()> {
+        let password_slots = self
+            .slots
+            .iter()
+            .filter(|s| matches!(s.kind, SlotKind::Password { .. }))
+            .count();
+        if self.slots.len() > MAX_SLOTS || password_slots > MAX_PASSWORD_SLOTS {
+            return Err(Error::Corrupt);
+        }
+        for slot in &self.slots {
+            if slot.label.as_ref().is_some_and(|l| l.len() > MAX_LABEL_LEN) {
+                return Err(Error::Corrupt);
+            }
+            if let SlotKind::Password { kdf, .. } = &slot.kind {
+                kdf.check()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Argon2id params, stored per password slot so they can be raised later without breaking compat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KdfParams {
     pub mem_cost_kib: u32,
@@ -68,21 +100,23 @@ impl KdfParams {
 /// Keyslot
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KeySlot {
-    /// Kind of keyslot
-    pub kind: SlotKind,
-    /// Argon2id salt or HKDF salt for recovery keyslot
-    pub salt: [u8; 16],
+    /// Optional human label. Plaintext, and unauthenticated until the MAC check.
+    pub label: Option<String>,
     /// Nonce for XChaCha20Poly1305
     pub nonce: [u8; 24],
-    /// XChaCha20Poly1305(KEK, MK): 32 bytes of key + 16 bytes of Poly1305 tag
-    pub encrypted_mk: Vec<u8>,
+    /// XChaCha20Poly1305(KEK, MK) ciphertext
+    pub wrapped_mk: [u8; 32],
+    /// Poly1305 tag over `wrapped_mk`
+    pub tag: [u8; 16],
+    /// Kind of keyslot, plus whatever it needs to derive its KEK
+    pub kind: SlotKind,
 }
 
 impl KeySlot {
     /// Associated data for wrapping MK. Binds the slot to *this* vault and
     /// *this* slot kind, so a slot copied from another vault (even one with
     /// the same password) or relabelled as a different kind won't open.
-    pub fn aad(vault_id: &[u8; 16], kind: SlotKind) -> Vec<u8> {
+    pub fn aad(vault_id: &[u8; 16], kind: &SlotKind) -> Vec<u8> {
         let mut aad = Vec::with_capacity(MAGIC.len() + size_of_val(&FORMAT_VERSION) + 16 + 1);
         aad.extend_from_slice(&MAGIC);
         aad.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -92,18 +126,30 @@ impl KeySlot {
     }
 }
 
-/// Slot kind
+/// Slot kind.
+///
+/// postcard encodes variants by index, so this order is part of the on-disk
+/// format: only ever append new variants, never reorder or remove one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SlotKind {
-    Password,
-    Recovery,
+    Password {
+        /// Argon2id salt
+        salt: [u8; 16],
+        /// Per slot, so one slot's cost can be raised without touching the others
+        kdf: KdfParams,
+    },
+    Recovery {
+        /// HKDF salt
+        salt: [u8; 16],
+    },
 }
 
 impl SlotKind {
+    /// Same as the postcard variant index.
     fn tag(&self) -> u8 {
         match self {
-            SlotKind::Password => 0,
-            SlotKind::Recovery => 1,
+            SlotKind::Password { .. } => 0,
+            SlotKind::Recovery { .. } => 1,
         }
     }
 }
@@ -138,7 +184,7 @@ pub fn decode(bytes: &[u8]) -> Result<Unverified<'_>> {
     if !rest.is_empty() {
         return Err(Error::Corrupt);
     }
-    header.kdf.check()?;
+    header.check()?;
     Ok(Unverified {
         header,
         signed,

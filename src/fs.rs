@@ -26,18 +26,27 @@ pub fn tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Always a fresh file: a leftover temp (from a crash, or planted) is removed
+/// first and the new one is opened `create_new`, so we never follow a symlink
+/// or inherit a stale file's permissions. Removes the temp again on failure.
 pub fn write_tmp(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let tmp = tmp_path(path);
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let mut f = opts.open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(tmp)
 }
 
@@ -75,6 +84,9 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 /// header or the new one, never half of each.
 pub fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = write_tmp(path, bytes)?;
-    fs::rename(&tmp, path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     sync_parent(path)
 }

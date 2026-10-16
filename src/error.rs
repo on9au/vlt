@@ -32,4 +32,12 @@ pub enum Error {
 
     #[error("a file already exists at that path")]
     AlreadyExists,
+
+    /// Several slots fit and picking one silently would be a guess. Holds
+    /// the choices, formatted for the user.
+    #[error("more than one password slot fits; choose one of: {0}")]
+    SlotRequired(String),
+
+    #[error("no password slot with that index or label")]
+    NoSuchSlot,
 }
